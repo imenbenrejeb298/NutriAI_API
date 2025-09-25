@@ -1,22 +1,21 @@
-# Image Python légère
+# Dockerfile
 FROM python:3.11-slim
 
-# Empêche le buffering des logs
-ENV PYTHONUNBUFFERED=1 \
-    PIP_NO_CACHE_DIR=1
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
 
-# Dossier de travail
 WORKDIR /app
 
 # Dépendances
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir --upgrade pip \
+ && pip install --no-cache-dir -r requirements.txt
 
-# Code de l'app
+# Code
 COPY . .
 
-# Render fournit le port via la variable d'env $PORT
+# Info : Render injecte $PORT. Par défaut, 10000 en local.
 EXPOSE 10000
 
-# Commande de démarrage : utilise $PORT si présent, sinon 10000
-CMD ["/bin/sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT:-10000}"]
+# Démarrage : on cible asgi:app (au lieu de main:app)
+CMD ["/bin/sh","-lc","uvicorn asgi:app --host 0.0.0.0 --port ${PORT:-10000}"]
