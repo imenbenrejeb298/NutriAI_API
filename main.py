@@ -1,7 +1,8 @@
-# C:\NutriAI_API\main.py
+# main.py — NutriAI API (FastAPI)
 from __future__ import annotations
 
 import os
+from pathlib import Path
 from typing import Any, Dict, List
 
 from fastapi import FastAPI, HTTPException
@@ -18,8 +19,10 @@ def _as_bool(v: str | None, default: bool = False) -> bool:
     return v.strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
-# Active le remplissage démo si NUTRIAI_DEMO=true
+# Lu une fois au démarrage (si vous modifiez l'ENV, redémarrez le serveur)
 DEMO_FILL = _as_bool(os.getenv("NUTRIAI_DEMO"), False)
+
+# ------------------- FastAPI app -------------------
 
 app = FastAPI()
 app.add_middleware(
@@ -30,19 +33,23 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --------- Modèles ---------
+# ------------------- Modèles Pydantic -------------------
+
 class MealItem(BaseModel):
     name: str
     qty: float
     unit: str
 
+
 class Meal(BaseModel):
     name: str | None = None
     items: List[MealItem] = Field(default_factory=list)
 
+
 class PlanDay(BaseModel):
     day: int
     meals: List[Meal] = Field(default_factory=list)
+
 
 class GenerateMealPlanRequest(BaseModel):
     age: int
@@ -51,12 +58,47 @@ class GenerateMealPlanRequest(BaseModel):
     goal: str
     days: int = Field(gt=0, le=14)
 
+
 class GenerateMealPlanResponse(BaseModel):
     per_day: List[PlanDay]
 
-# --------- Utilitaires ---------
+
+# ------------------- Root & util -------------------
+
+@app.get("/")
+def root() -> Dict[str, Any]:
+    return {
+        "message": "NutriAI API OK",
+        "schema": SCHEMA_NAME,
+        "version": APP_VERSION,
+        "demo": DEMO_FILL,
+    }
+
+
+@app.get("/__env")
+def env() -> Dict[str, Any]:
+    return {
+        "demo": DEMO_FILL,
+        "NUTRIAI_DEMO": os.getenv("NUTRIAI_DEMO"),
+        "schema": SCHEMA_NAME,
+        "version": APP_VERSION,
+    }
+
+
+@app.get("/__whoami")
+def whoami() -> Dict[str, Any]:
+    return {"file": str(Path(__file__).resolve())}
+
+
+@app.get("/health")
+def health() -> Dict[str, Any]:
+    return {"ok": True}
+
+
+# ------------------- Generate -------------------
+
 def _demo_meals() -> List[Meal]:
-    # Un repas démo avec 3 items
+    # Un "repas" démo avec 3 items
     return [
         Meal(
             name="Démo",
@@ -68,31 +110,7 @@ def _demo_meals() -> List[Meal]:
         )
     ]
 
-# --------- Endpoints d'info ---------
-@app.get("/")
-def root() -> Dict[str, Any]:
-    return {
-        "message": "NutriAI API OK",
-        "schema": SCHEMA_NAME,
-        "version": APP_VERSION,
-        "demo": DEMO_FILL,
-    }
 
-@app.get("/__env")
-def env() -> Dict[str, Any]:
-    return {
-        "schema": SCHEMA_NAME,
-        "version": APP_VERSION,
-        "demo": DEMO_FILL,
-        "NUTRIAI_DEMO": os.getenv("NUTRIAI_DEMO"),
-    }
-
-@app.get("/__whoami")
-def whoami() -> Dict[str, Any]:
-    # Permet de vérifier QUEL fichier tourne réellement
-    return {"file": os.path.abspath(__file__)}
-
-# --------- Génération ---------
 @app.post("/generate_meal_plan", response_model=GenerateMealPlanResponse)
 def generate_meal_plan(body: GenerateMealPlanRequest) -> GenerateMealPlanResponse:
     per_day: List[PlanDay] = []
@@ -100,53 +118,71 @@ def generate_meal_plan(body: GenerateMealPlanRequest) -> GenerateMealPlanRespons
         per_day.append(PlanDay(day=i, meals=_demo_meals() if DEMO_FILL else []))
     return GenerateMealPlanResponse(per_day=per_day)
 
-# --------- Agrégation ---------
+
+# ------------------- Aggregate -------------------
 # Accepte:
-#  A) {"per_day":[{"day":1,"items":[{name,qty,unit}, ...]}, ...]}
-#  B) {"per_day":[{"day":1,"meals":[{"items":[{name,qty,unit}, ...]}, ...]}, ...]}
+# A) {"per_day":[{"day":1,"items":[{name,qty,unit}, ...]}, ...]}
+# B) {"per_day":[{"day":1,"meals":[{"items":[{name,qty,unit}, ...]}, ...]}, ...]}
+
 @app.post("/shopping_aggregate")
 def shopping_aggregate(body: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
     if "per_day" not in body or not isinstance(body["per_day"], list):
         raise HTTPException(status_code=422, detail="per_day must be a list")
 
     per_day = body["per_day"]
-    items: List[MealItem] = []
 
     def parse_item(raw: Any) -> MealItem | None:
         try:
-            return MealItem.model_validate(raw)  # pydantic v2
+            # pydantic v2
+            return MealItem.model_validate(raw)
         except Exception:
             return None
+
+    items: List[MealItem] = []
 
     for day in per_day:
         if not isinstance(day, dict):
             continue
+
         # Schéma A: per_day[].items
-        if isinstance(day.get("items"), list):
+        if "items" in day and isinstance(day["items"], list):
             for it in day["items"]:
                 p = parse_item(it)
                 if p:
                     items.append(p)
+
         # Schéma B: per_day[].meals[].items
-        elif isinstance(day.get("meals"), list):
+        elif "meals" in day and isinstance(day["meals"], list):
             for meal in day["meals"]:
                 if isinstance(meal, dict) and isinstance(meal.get("items"), list):
                     for it in meal["items"]:
                         p = parse_item(it)
                         if p:
                             items.append(p)
+        # sinon on ignore la journée
 
-    # Somme par (name, unit)
+    # Agrégation par (name normalisé, unit)
     totals: Dict[tuple[str, str], float] = {}
-    display: Dict[tuple[str, str], str] = {}
+    pretty_name: Dict[tuple[str, str], str] = {}
+
     for it in items:
         key = (it.name.strip().lower(), it.unit.strip())
         totals[key] = totals.get(key, 0.0) + float(it.qty)
-        display.setdefault(key, it.name)
+        if key not in pretty_name:
+            pretty_name[key] = it.name  # conserve la casse "jolie"
 
     result: Dict[str, Dict[str, Any]] = {}
     for key, qty in totals.items():
-        pretty = display[key]
+        display = pretty_name[key]
         unit = key[1]
-        result[pretty] = {"qty": qty, "unit": unit}
+        result[display] = {"qty": qty, "unit": unit}
+
     return result
+
+
+# Optionnel: exécution locale (utile en dev)
+if __name__ == "__main__":
+    import uvicorn
+
+    port = int(os.getenv("PORT") or "10000")
+    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=True)
